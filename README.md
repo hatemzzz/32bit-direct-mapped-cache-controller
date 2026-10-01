@@ -1,132 +1,156 @@
-# 🖥️ 32-bit Direct-Mapped L1 Cache Subsystem with Write-Back Architecture
+# 32-bit Direct-Mapped L1 Cache Controller (Write-Back, Write-Allocate)
 
-A synthesizable 32-bit Direct-Mapped L1 Cache Subsystem implemented in Verilog HDL. The design integrates a 6-state control FSM with write-back and write-allocate policies, multi-word line support (128-bit / 16-byte blocks), dirty-line tracking, and deterministic bus-stall handshaking.
+
+![language](https://img.shields.io/badge/HDL-Verilog--2001-orange)
+
+A synthesizable 32-bit direct-mapped L1 data cache controller written in Verilog. It uses a 7-state FSM with **write-back** and **write-allocate** policies, 128-bit (4-word) cache lines, line-level valid/dirty tracking, an explicit turnaround drain state, and a stall handshake to the CPU during memory transactions.
+
+---
+
+## Overview
+
+The cache sits between a 32-bit CPU interface and a main-memory interface:
+
+| Access type | Behavior |
+|---|---|
+| **Read hit** | Word is returned from the cache with zero memory access cycles. |
+| **Write hit** | Cache line is updated and marked dirty. No memory write occurs. |
+| **Miss, clean victim** | The missing line is fetched from main memory and installed (`FILL`). |
+| **Miss, dirty victim** | The dirty line is written back to main memory (`MISS_WRITEBACK`), the bus turnaround cycle clears memory handshakes (`WB_DRAIN`), and the new line is fetched (`MISS_WAIT` → `FILL`). |
+| **Write miss** | Write-allocate: the line is fetched from memory first, the write is merged into the line, and the line is marked dirty. |
+
+---
+
+## Features
+
+- 32-bit address and data CPU interface
+- 128-bit (16-byte, 4-word) cache lines to exploit spatial locality
+- Direct-mapped organization (one comparator, no replacement policy overhead)
+- Write-back policy with dirty-bit tracking to minimize memory bus traffic
+- Write-allocate on write misses
+- 7-state FSM sequencing hits, misses, line fills, and dedicated writeback drain
+- Integrated hardware performance counters tracking total accesses, hits, and misses
+- Ready/stall handshake protocol with CPU and main memory
+
+---
+
+## Cache Configuration
+
+| Parameter | Value | Notes |
+|---|---|---|
+| Organization | Direct-mapped | 1-way |
+| Address width | 32 bits | Byte-addressable |
+| CPU data width | 32 bits | Single-word access |
+| Line size | 128 bits (16 bytes) | 4 words per line |
+| Number of sets | 64 | 64 lines (`NUM_LINES = 64`) |
+| Total capacity | 1024 Bytes (1 KB) | 64 lines × 16 bytes |
+| Write policy | Write-back | Updates dirty array on write hit |
+| Allocation policy | Write-allocate | Fetches block on write miss |
+
+### Address Breakdown
+
+| Bits | Field | Width | Purpose |
+|---|---|---|---|
+| `[31:10]` | Tag | 22 bits | Compared against the stored tag in `cache_storage` |
+| `[9:4]` | Index | 6 bits | Selects 1 of 64 cache lines |
+| `[3:2]` | Word offset | 2 bits | Selects 1 of 4 words (32-bit) in the 128-bit line |
+| `[1:0]` | Byte offset | 2 bits | Byte alignment within the word |
+
+---
+
+## Architecture
+
+<img width="2560" height="1038" alt="project-architecture" src="https://github.com/user-attachments/assets/a43e3110-4347-41e3-96af-c848f6ac661a" />
+
+- **CPU-side interface:** Latches read/write requests, asserts `cpu_ready` to complete transactions, and returns requested read words.
+- **Cache controller (`cache_controller.v`):** FSM that performs tag comparisons, controls datapath multiplexing, drives memory requests, and manages transaction state transitions.
+- **Cache storage (`cache_storage.v`):** Tag array, valid array, dirty array, and 128-bit wide SRAM data blocks.
+- **Memory interface:** Multi-cycle handshake transactions (`mem_rd_en`, `mem_wr_en`, `mem_ready`) with main memory.
+
+### Finite State Machine
+
+<img width="680" height="560" alt="fsm_diagram" src="https://github.com/user-attachments/assets/0db2565a-ff56-45f6-9e4d-cf4dd916b90f" />
+
+
+| State | Description |
+|---|---|
+| `IDLE` | Waits for incoming CPU read (`cpu_rd_en`) or write (`cpu_wr_en`) requests. |
+| `COMPARE` | Checks tag equality and inspects valid and dirty status of the indexed line. |
+| `HIT` | Serves CPU request. Reads return the requested 32-bit word; writes update the line and set dirty. |
+| `MISS_WRITEBACK` | Flushes the dirty victim line back to main memory until `mem_ready` asserts. |
+| `WB_DRAIN` | Turnaround cycle: de-asserts `mem_wr_en` to allow `mem_ready` to drop before read requests. |
+| `MISS_WAIT` | Asserts memory read request for the target line and waits for `mem_ready`. |
+| `FILL` | Installs the 128-bit line into cache storage, updates tag/valid/dirty bits, and releases the CPU with `cpu_ready`. |
+
+### Access Latency
+
+| Case | Typical Latency (Cycles) | State Sequence |
+|---|---|---|
+| Read / Write hit | 2 cycles | `IDLE` → `COMPARE` → `HIT` → `IDLE` |
+| Miss, clean victim | 3 + memory read latency | `IDLE` → `COMPARE` → `MISS_WAIT` → `FILL` → `IDLE` |
+| Miss, dirty victim | 5 + memory write + memory read latency | `IDLE` → `COMPARE` → `MISS_WRITEBACK` → `WB_DRAIN` → `MISS_WAIT` → `FILL` → `IDLE` |
+
+---
+
+## Repository Structure
+
+```text
+├── rtl/
+│   ├── cache_controller.v     # 7-state FSM controller and datapath steering
+│   └── cache_storage.v        # Tag, valid, dirty, and 128-bit data array storage
+├── tb/
+│   ├── main_memory.v          # Behavioral memory model with configurable handshake
+│   ├── perf_counters.v        # Hardware performance monitor (accesses, hits, misses)
+│   ├── trace_generator.v      # Deterministic/conflict trace stimulus generator
+│   └── tb_cache_controller.v  # Top-level testbench
+├── docs/                      # Architecture diagrams, FSM charts, and waveforms
+├── Makefile                   # Targets for sim, wave, and synth
+└── README.md
+```
 
 ---
 
 
-## 📖 Project Overview
 
-This project implements an L1 data cache subsystem designed to bridge the core processor and off-chip memory hierarchy:
-- **Cache Read Hit:** The requested word is returned directly to the CPU with zero memory stall cycles.
-- **Cache Write Hit:** Data updates the cache line directly and asserts the **Dirty** bit without stalling for off-chip writes.
-- **Cache Miss (Clean Line):** The controller fetches the missing line directly from main memory into the cache storage.
-- **Cache Miss (Dirty Line):** The modified line is evicted back to memory (`MISS_WRITEBACK`) before loading the new block (`FILL`).
+## Verification
 
----
+The testbench (`tb_cache_controller.v`) validates design correctness using directed corner cases followed by an automated conflict-generating trace.
 
-## ✨ Features
+### Directed Scenarios
 
-- ✔️ **32-bit CPU Architecture:** Native 32-bit address and data CPU interface.
-- ✔️ **Multi-Word Cache Line:** 128-bit (16-byte / 4-word) line size to exploit spatial locality.
-- ✔️ **Direct-Mapped Organization:** Fast single-cycle lookups and tag checks.
-- ✔️ **Write-Back Policy:** Employs dirty-bit tracking to minimize external memory traffic.
-- ✔️ **Write-Allocate Policy:** Fetches missing blocks on write misses.
-- ✔️ **Deterministic 6-State FSM:** Sequences hit paths, memory stalls, and dirty-line writebacks.
-- ✔️ **Hardware Handshake:** Drives wait/stall controls to the core during off-chip memory operations.
+1. **Compulsory Cold Miss:** Read access to `0x00000000` misses on startup. Memory returns block `128'hDEADBEEF_CAFEF00D_11223344_AABBCCDD`, fills set 0, and returns word `0xAABBCCDD`.
+2. **Read Hit:** Subsequent read to `0x00000000` evaluates as a hit in `COMPARE`, serving the word directly from `cache_storage` without accessing memory.
+3. **Write Miss & Dirty Eviction:**
+   - Write to `0x00000100` with data `0xDEADBEEF`: the controller allocates the missing line from memory, applies the write to the word, and sets dirty to 1.
+   - Read to colliding address `0x00000500` (same index `6'd16`, different tag): the controller initiates dirty eviction, writes the modified line back to `0x00000100`, transitions through `WB_DRAIN`, and fetches the line for `0x00000500`.
 
----
+### Stress Test & Hardware Performance Counters
 
-## 🏗️ Cache Configuration
+An automated trace generator (`trace_generator.v`) issues continuous reads and writes across conflicting sets (e.g., indices 0, 4, 8, 12, 16) to verify back-to-back dirty evictions and stall releases under heavy memory bus pressure.
 
-| Parameter | Specification | Details |
-| :--- | :--- | :--- |
-| **Cache Architecture** | Direct-Mapped | 1 block per set |
-| **Address Width** | 32 bits | Byte-addressable address space |
-| **CPU Data Bus** | 32 bits | Word-level transactions |
-| **Line / Block Size** | 128 bits (16 Bytes) | 4 words per cache block |
-| **Block Offset Bits** | 4 bits | Byte indexing within line (`[3:0]`) |
-| **Write Policy** | Write-Back | Flushes data to memory only on dirty block eviction |
-| **Allocation Policy** | Write-Allocate | Fetches block from memory on write misses |
+Hardware performance counters (`perf_counters.v`) record access metrics during simulation:
 
----
+| Metric | Result (Stress Trace) | Notes |
+|---|---|---|
+| Total Accesses | 40 | Combined manual and trace accesses |
+| Cache Hits | 20 | Verified cache hits |
+| Cache Misses | 20 | Handled line fills and writebacks |
+| Measured Hit Rate | 50.0% | Adversarial trace forcing set collisions |
 
-## 🧩 Subsystem Architecture
-
-<img width="2560" height="1038" alt="architecture" src="https://github.com/user-attachments/assets/66c8559b-2901-465a-ac64-07230b94c901" />
+The 50% hit rate is intentional: the trace generator deliberately addresses colliding sets to keep eviction and writeback logic fully exercised under worst-case conflicts.
 
 
-The subsystem separates control sequencing from datapath flow:
-- **CPU Side Interface:** Latches read/write commands, drives wait/stall signals, and returns read data.
-- **Cache System Controller:** Central FSM managing tag comparisons, multiplexer steering, and memory requests.
-- **Cache Storage:** Tag/status array (tag, valid, dirty) and high-density data memory array.
-- **Main Memory Interface:** Handles multi-cycle bus transactions with external DRAM.
 
----
+## Limitations
 
-## ⚙️ Finite State Machine (FSM)
+- Word-granularity access only (no byte-enable or halfword write support).
+- Blocking cache: the CPU stalls for the duration of every miss transaction.
+- Direct-mapped structure is subject to conflict misses under alternating colliding addresses.
 
-<img width="680" height="560" alt="fsm_diagram" src="https://github.com/user-attachments/assets/9ac31dca-d1ba-4c80-9527-109f7ea2e332" />
+## Future Work
 
-
-The controller transitions across 6 dedicated states:
-
-- 🔹 **`IDLE`**: Waits for an active CPU memory request.
-- 🔹 **`COMPARE`**: Compares the incoming address tag against the stored tag and checks valid/dirty status.
-- 🔹 **`HIT`**: Services the core directly; reads return immediately, writes mark the line dirty.
-- 🔹 **`MISS_WRITEBACK`**: Flushes modified lines to main memory upon a conflict miss until `mem_ready` asserts.
-- 🔹 **`MISS_WAIT`**: Stalls the CPU while fetching the requested line from external memory.
-- 🔹 **`FILL`**: Loads the 128-bit block into the data array, sets valid, clears dirty, and services the CPU.
-
----
-
-## 📦 Module Descriptions
-
-- 🔹 **`cache_controller.v`**: FSM control path orchestrating hits, misses, bus stalls, and line fill logic.
-- 🔹 **`tag_array.v`**: Stores tag fields, valid bits, and dirty status bits.
-- 🔹 **`data_array.v`**: Implements 128-bit storage lines with word-level access logic.
-- 🔹 **`memory_model.v`**: Behavioral DRAM model generating memory-ready handshakes and simulated access latency.
-- 🔹 **`cache_top.v`**: Top-level integration uniting the controller, storage arrays, and bus multiplexers.
-- 🔹 **`cache_top_tb.v`**: Testbench executing directed corner-case scenarios and pseudorandom stress traces.
-
----
-
-## 🧪 Simulation Scenarios & Verification
-
-Verified using **ModelSim** through targeted corner-case testing followed by an automated memory trace generator:
-
-### 🔹 Directed Verification Scenarios
-* **Scenario 1 — Compulsory Cold Miss:**
-  - Reading uninitialized address `0x00000000` triggers a cold miss at `t = 105`.
-  - Memory responds with block data, loading `0xAABBCCDD` into the cache line.
-* **Scenario 2 — Read Hit Latency:**
-  - Reading address `0x00000000` again at `t = 145`.
-  - Tag matches; data `0xAABBCCDD` is served immediately with zero wait states.
-* **Scenario 3 — Write Hit & Dirty Line Eviction:**
-  - `WRITE addr=00000100 <- data=deadbeef` at `t = 205` modifies the line and flags it as dirty.
-  - Subsequent read to conflicting address `0x00000500` triggers an eviction at `t = 245`.
-  - Controller executes writeback of dirty line (`0x000000000000000000000000deadbeef`) to memory address `0x00000100` before filling the new block.
-
----
-
-### 🔹 Trace Generator Stress Test
-An automated trace generator executed a continuous stream of reads and writes targeting conflicting set indices (0, 4, 8, 12, 16):
-- Validated consecutive 128-bit dirty block evictions (e.g., writing back modified block `deadbeefcafef00d1122334400000000` to `mem_addr = 0x00000000`).
-- Confirmed deterministic memory handshakes and stall releases under heavy bus pressure.
-
----
-
-## 📊 Verification Metrics (ModelSim)
-
-| Metric | Result | Analysis |
-| :--- | :---: | :--- |
-| **Total Memory Accesses** | `40` | Directed scenarios + pseudorandom trace sequence |
-| **Total Cache Hits** | `20` | Serviced immediately without memory stalls |
-| **Total Cache Misses** | `20` | Cold misses and conflict evictions |
-| **Overall Hit Rate** | **`50.0%`** | High-conflict stress trace verifying eviction logic |
-
----
-
-## 🛠️ Tools Used
-
-- **HDL:** Verilog HDL (IEEE 1364-2001)
-- **Simulation:** ModelSim / QuestaSim
-- **Waveform Inspection:** ModelSim Wave Viewer
-
----
-
-## 🚀 Future Improvements
-
-- Parameterized associativity (2-Way / 4-Way Set-Associative) with pseudo-LRU replacement.
-- Non-blocking cache design supporting hit-under-miss using Miss Status Holding Registers (MSHR).
-- AXI4-Lite / Avalon-MM standard bus wrappers for SoC bus integration.
+- Parameterized `NUM_LINES`, `TAG_WIDTH`, and `DATA_WIDTH` at controller top level.
+- Byte-enable support for sub-word writes (`cpu_byte_en`).
+- 2-way / 4-way set-associative version with pseudo-LRU replacement.
+- Non-blocking hit-under-miss operation with Miss Status Holding Registers (MSHRs).
+- Standard bus wrapper (AXI4-Lite or Wishbone).
